@@ -3,7 +3,6 @@ import os
 import pickle
 import faiss
 import numpy as np
-import torch
 from fastapi import FastAPI
 from sentence_transformers import SentenceTransformer
 
@@ -12,7 +11,7 @@ app = FastAPI()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INDEX_DIR = os.path.join(BASE_DIR, "..", "data", "index")
 
-model = SentenceTransformer("all-MiniLM-L6-v2", model_kwargs={"torch_dtype": torch.float32})
+model = SentenceTransformer("all-MiniLM-L6-v2", model_kwargs={"use_safetensors": False})
 index = faiss.read_index(os.path.join(INDEX_DIR, "faiss_index.bin"))
 
 with open(os.path.join(INDEX_DIR, "movie_lookup.pkl"), "rb") as f:
