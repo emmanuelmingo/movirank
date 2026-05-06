@@ -52,7 +52,11 @@ def load_data():
         os.path.join(PROCESSED_DIR, "ratings.parquet"),
         columns=["userId", "movieId", "rating"],
     )
-    feature_matrix   = np.load(os.path.join(INDEX_DIR, "feature_matrix.npy"))
+    movies = pd.read_parquet(
+        os.path.join(PROCESSED_DIR, "movies_enriched.parquet"),
+        columns=["movieId", "year"],
+    )
+    feature_matrix    = np.load(os.path.join(INDEX_DIR, "feature_matrix.npy"))
     feature_movie_ids = np.load(os.path.join(INDEX_DIR, "feature_movie_ids.npy"))
     with open(os.path.join(INDEX_DIR, "feature_names.pkl"), "rb") as f:
         feature_names = pickle.load(f)
@@ -61,7 +65,7 @@ def load_data():
     print(f"  Unique users   : {ratings['userId'].nunique():>12,}")
     print(f"  Feature matrix : {feature_matrix.shape}")
     print(f"  Loaded in {time.time() - t:.1f}s")
-    return ratings, feature_matrix, feature_movie_ids, feature_names
+    return ratings, movies, feature_matrix, feature_movie_ids, feature_names
 
 
 # ── 2. Sample users ────────────────────────────────────────────────────────────
@@ -78,19 +82,26 @@ def sample_users(ratings, n, min_ratings, seed):
 
 # ── 3. Build training pairs ────────────────────────────────────────────────────
 
-def build_pairs(ratings, feature_matrix, feature_movie_ids, sampled_users, seed):
+def build_pairs(ratings, movies, feature_matrix, feature_movie_ids, sampled_users, seed):
     """
     Returns a DataFrame with columns:
-      userId, movieId, label, feat_idx, genre_overlap
+      userId, movieId, label, feat_idx,
+      genre_overlap, user_avg_rating_norm, user_watch_count_norm, user_decade_match
     """
     print("\nStep 3: Building training pairs...")
     t = time.time()
     rng = np.random.default_rng(seed)
 
-    movie_to_idx  = {int(mid): i for i, mid in enumerate(feature_movie_ids)}
-    feat_movie_arr = feature_movie_ids          # np array for fast isin checks
-    genre_matrix  = feature_matrix[:, :19]      # first 19 cols are genre multi-hot
-    user_set      = set(sampled_users.tolist())
+    movie_to_idx   = {int(mid): i for i, mid in enumerate(feature_movie_ids)}
+    feat_movie_arr = feature_movie_ids
+    genre_matrix   = feature_matrix[:, :19]
+    user_set       = set(sampled_users.tolist())
+
+    # Movie decade map: movieId -> decade (e.g. 1994 -> 1990)
+    movie_decade_map = {
+        int(r.movieId): (int(r.year) // 10) * 10
+        for r in movies.dropna(subset=["year"]).itertuples()
+    }
 
     # Filter ratings once
     rat = ratings[
@@ -98,7 +109,7 @@ def build_pairs(ratings, feature_matrix, feature_movie_ids, sampled_users, seed)
         ratings["movieId"].isin(movie_to_idx)
     ].copy()
 
-    # Graded label for positives
+    # Graded labels
     rat["label"] = 0
     rat.loc[rat["rating"] >= 5.0, "label"] = 2
     rat.loc[(rat["rating"] >= 4.0) & (rat["rating"] < 5.0), "label"] = 1
@@ -106,47 +117,61 @@ def build_pairs(ratings, feature_matrix, feature_movie_ids, sampled_users, seed)
     pos = rat[rat["rating"] >= POS_THRESHOLD][["userId", "movieId", "label"]].copy()
     pos["feat_idx"] = pos["movieId"].map(movie_to_idx).astype(int)
 
-    # Per-user genre affinity: mean genre vector of their positives
-    pos_feat_indices = pos.groupby("userId")["feat_idx"].apply(list)
-    user_genre_affinity = {
-        uid: genre_matrix[idxs].mean(axis=0)
-        for uid, idxs in pos_feat_indices.items()
-    }
+    # Per-user stats computed once from all their ratings
+    user_stats = {}
+    for uid, group in rat.groupby("userId"):
+        pos_mids = group.loc[group["rating"] >= POS_THRESHOLD, "movieId"]
+        decades  = [movie_decade_map[int(m)] for m in pos_mids if int(m) in movie_decade_map]
+        fav_decade = max(set(decades), key=decades.count) if decades else 0
+        user_stats[uid] = {
+            "avg_rating_norm"     : (group["rating"].mean() - 0.5) / 4.5,
+            "watch_count_norm"    : min(np.log1p(len(group)) / np.log1p(10_000), 1.0),
+            "favorite_decade"     : fav_decade,
+            "genre_affinity"      : genre_matrix[
+                [movie_to_idx[int(m)] for m in pos_mids if int(m) in movie_to_idx]
+            ].mean(axis=0) if len(pos_mids) else np.zeros(19),
+        }
 
-    # Vectorised genre_overlap for positives
-    pos_user_vecs  = np.stack([user_genre_affinity[uid] for uid in pos["userId"]])
+    # Vectorised user features for positives
+    pos_stats = [user_stats[uid] for uid in pos["userId"]]
+    pos_user_vecs  = np.stack([s["genre_affinity"] for s in pos_stats])
     pos_movie_vecs = genre_matrix[pos["feat_idx"].to_numpy()]
-    pos["genre_overlap"] = (pos_user_vecs * pos_movie_vecs).sum(axis=1)
+    pos["genre_overlap"]          = (pos_user_vecs * pos_movie_vecs).sum(axis=1)
+    pos["user_avg_rating_norm"]   = [s["avg_rating_norm"]  for s in pos_stats]
+    pos["user_watch_count_norm"]  = [s["watch_count_norm"] for s in pos_stats]
+    pos["user_decade_match"]      = [
+        1.0 if movie_decade_map.get(int(mid), -1) == user_stats[uid]["favorite_decade"] else 0.0
+        for uid, mid in zip(pos["userId"], pos["movieId"])
+    ]
 
-    # Negatives: per user, sample from unseen movies
-    rated_by_user = rat.groupby("userId")["movieId"].apply(set)
+    # Negatives: sample unseen movies per user
+    rated_by_user     = rat.groupby("userId")["movieId"].apply(set)
     pos_count_by_user = pos.groupby("userId").size()
 
     neg_rows = []
     for uid in sampled_users:
-        if uid not in pos_count_by_user:
+        if uid not in pos_count_by_user or uid not in user_stats:
             continue
-        seen  = rated_by_user.get(uid, set())
-        mask  = ~np.isin(feat_movie_arr, list(seen))
-        unseen = feat_movie_arr[mask]
+        seen   = rated_by_user.get(uid, set())
+        unseen = feat_movie_arr[~np.isin(feat_movie_arr, list(seen))]
         n_neg  = min(int(pos_count_by_user[uid]) * NEG_RATIO, len(unseen))
         if n_neg == 0:
             continue
-        neg_ids = rng.choice(unseen, size=n_neg, replace=False)
-        aff     = user_genre_affinity[uid]
-        for mid in neg_ids:
-            fi = movie_to_idx[int(mid)]
-            overlap = float(np.dot(aff, genre_matrix[fi]))
-            neg_rows.append((uid, int(mid), 0, fi, overlap))
+        stats = user_stats[uid]
+        for mid in rng.choice(unseen, size=n_neg, replace=False):
+            fi      = movie_to_idx[int(mid)]
+            overlap = float(np.dot(stats["genre_affinity"], genre_matrix[fi]))
+            decade_match = 1.0 if movie_decade_map.get(int(mid), -1) == stats["favorite_decade"] else 0.0
+            neg_rows.append((uid, int(mid), 0, fi, overlap,
+                             stats["avg_rating_norm"], stats["watch_count_norm"], decade_match))
 
-    neg_df = pd.DataFrame(neg_rows, columns=["userId", "movieId", "label", "feat_idx", "genre_overlap"])
+    neg_df = pd.DataFrame(neg_rows, columns=[
+        "userId", "movieId", "label", "feat_idx",
+        "genre_overlap", "user_avg_rating_norm", "user_watch_count_norm", "user_decade_match",
+    ])
 
-    df = pd.concat([pos, neg_df], ignore_index=True)
-    df = df.sort_values("userId").reset_index(drop=True)
-
-    n_pos = (df["label"] > 0).sum()
-    n_neg = (df["label"] == 0).sum()
-    print(f"  Pairs built: {len(df):,}  (pos={n_pos:,}, neg={n_neg:,})")
+    df = pd.concat([pos, neg_df], ignore_index=True).sort_values("userId").reset_index(drop=True)
+    print(f"  Pairs: {len(df):,}  (pos={(df['label']>0).sum():,}, neg={(df['label']==0).sum():,})")
     print(f"  Built in {time.time() - t:.1f}s")
     return df
 
@@ -182,9 +207,10 @@ def user_split(df, sampled_users, val_frac, test_frac, seed):
 def to_lgb_arrays(df, feature_matrix, all_feat_names):
     """Returns X, y, group sizes (sorted by userId)."""
     df = df.sort_values("userId")
-    item_feats    = feature_matrix[df["feat_idx"].to_numpy()]
-    genre_overlap = df["genre_overlap"].to_numpy(dtype=np.float32).reshape(-1, 1)
-    X      = np.hstack([item_feats, genre_overlap]).astype(np.float32)
+    item_feats   = feature_matrix[df["feat_idx"].to_numpy()]
+    user_feats   = df[["genre_overlap", "user_avg_rating_norm",
+                        "user_watch_count_norm", "user_decade_match"]].to_numpy(dtype=np.float32)
+    X      = np.hstack([item_feats, user_feats]).astype(np.float32)
     y      = df["label"].to_numpy(dtype=np.int32)
     groups = df.groupby("userId", sort=True).size().to_numpy(dtype=np.int32)
     return X, y, groups
@@ -284,14 +310,16 @@ def main():
     print("CineRank - LightGBM Ranker Training")
     print("=" * 55)
 
-    ratings, feature_matrix, feature_movie_ids, feature_names = load_data()
+    ratings, movies, feature_matrix, feature_movie_ids, feature_names = load_data()
     sampled_users = sample_users(ratings, N_USERS, MIN_RATINGS, SEED)
 
-    df = build_pairs(ratings, feature_matrix, feature_movie_ids, sampled_users, SEED)
+    df = build_pairs(ratings, movies, feature_matrix, feature_movie_ids, sampled_users, SEED)
 
     train_df, val_df, test_df = user_split(df, sampled_users, VAL_FRAC, TEST_FRAC, SEED)
 
-    all_feat_names = feature_names + ["genre_overlap"]
+    all_feat_names = feature_names + [
+        "genre_overlap", "user_avg_rating_norm", "user_watch_count_norm", "user_decade_match",
+    ]
     X_tr,  y_tr,  g_tr  = to_lgb_arrays(train_df, feature_matrix, all_feat_names)
     X_val, y_val, g_val  = to_lgb_arrays(val_df,   feature_matrix, all_feat_names)
     X_te,  y_te,  g_te   = to_lgb_arrays(test_df,  feature_matrix, all_feat_names)

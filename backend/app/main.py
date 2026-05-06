@@ -26,26 +26,51 @@ feature_store  = FeatureStore()
 with open(os.path.join(INDEX_DIR, "movie_lookup.pkl"), "rb") as f:
     movie_lookup = pickle.load(f)
 
+# movieId -> decade, built once at startup from movie_lookup
+movie_decade_map: dict[int, int] = {}
+for entry in movie_lookup:
+    yr = entry.get("year")
+    if yr and not (isinstance(yr, float) and math.isnan(yr)):
+        movie_decade_map[entry["movieId"]] = (int(yr) // 10) * 10
+
 
 def _clean(movie: dict) -> dict:
     return {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in movie.items()}
 
 
-def _genre_affinity(candidate_indices: np.ndarray, user_id: int | None) -> np.ndarray:
+def _user_features(candidate_indices: np.ndarray, user_id: int | None) -> dict:
     """
-    Returns a (19,) genre affinity vector for scoring.
+    Returns a dict of user-level scalars used in the feature vector.
 
-    With user_id  → fetch the user's precomputed genre preference from Redis.
-    Without       → fall back to the mean genre vector of the top-20 FAISS hits,
-                    which approximates the genre of the query itself.
+    With a known user_id and Redis available:
+      - genre_affinity      : user's personal genre preference vector (19 floats)
+      - avg_rating_norm     : how picky the user is  (their mean rating, normalised)
+      - watch_count_norm    : how active the user is (log-normalised rating count)
+      - favorite_decade     : user's preferred movie decade (e.g. 1990)
+
+    Without a user (anonymous query):
+      - genre_affinity inferred from top-20 FAISS hits
+      - avg_rating_norm / watch_count_norm set to neutral 0.5
+      - favorite_decade = 0 (no decade match bonus applied)
     """
+    fallback_affinity = genre_matrix[candidate_indices[:20]].mean(axis=0)
+
     if user_id is not None and feature_store.available:
-        user_feats = feature_store.get_user_features(user_id)
-        if user_feats is not None:
-            return np.array(user_feats["genre_affinity"], dtype=np.float32)
+        feats = feature_store.get_user_features(user_id)
+        if feats is not None:
+            return {
+                "genre_affinity"   : np.array(feats["genre_affinity"], dtype=np.float32),
+                "avg_rating_norm"  : (feats["avg_rating_given"] - 0.5) / 4.5,
+                "watch_count_norm" : min(np.log1p(feats["watch_count"]) / np.log1p(10_000), 1.0),
+                "favorite_decade"  : feats["favorite_decade"],
+            }
 
-    # Fallback: infer affinity from top-20 retrieved candidates
-    return genre_matrix[candidate_indices[:20]].mean(axis=0)
+    return {
+        "genre_affinity"  : fallback_affinity,
+        "avg_rating_norm" : 0.5,
+        "watch_count_norm": 0.5,
+        "favorite_decade" : 0,
+    }
 
 
 @app.get("/")
@@ -55,21 +80,36 @@ def index_route():
 
 @app.get("/search")
 def get_movies(q: str, k: int = 10, user_id: int | None = None):
-    # ── Stage 1: FAISS retrieval — fetch 100 candidates ───────────────────────
+    # ── Stage 1: FAISS retrieval (100 candidates) ──────────────────────────────
     query_vector = model.encode([q], normalize_embeddings=True).astype(np.float32)
     _, candidate_indices = index.search(query_vector, 100)
-    candidate_indices = candidate_indices[0]                         # (100,)
+    candidate_indices = candidate_indices[0]                          # (100,)
 
-    # ── Genre affinity: from Redis user profile or FAISS fallback ─────────────
-    affinity = _genre_affinity(candidate_indices, user_id)           # (19,)
+    # ── User features from Redis (or fallback defaults) ────────────────────────
+    uf = _user_features(candidate_indices, user_id)
 
-    # ── Build feature matrix for all 100 candidates ───────────────────────────
-    X_items       = feature_matrix[candidate_indices]                # (100, 23)
-    genre_overlap = (genre_matrix[candidate_indices] * affinity).sum(axis=1, keepdims=True)
-    X             = np.hstack([X_items, genre_overlap]).astype(np.float32)  # (100, 24)
+    # ── Build feature matrix for all 100 candidates (27 features) ─────────────
+    X_items = feature_matrix[candidate_indices]                       # (100, 23)
+
+    genre_overlap = (genre_matrix[candidate_indices] * uf["genre_affinity"]).sum(axis=1)
+
+    decade_match = np.array([
+        1.0 if movie_decade_map.get(movie_lookup[i]["movieId"], -1) == uf["favorite_decade"]
+        else 0.0
+        for i in candidate_indices
+    ], dtype=np.float32)
+
+    user_cols = np.column_stack([
+        genre_overlap,
+        np.full(100, uf["avg_rating_norm"],  dtype=np.float32),
+        np.full(100, uf["watch_count_norm"], dtype=np.float32),
+        decade_match,
+    ])                                                                # (100, 4)
+
+    X = np.hstack([X_items, user_cols]).astype(np.float32)           # (100, 27)
 
     # ── Stage 2: LightGBM re-ranking ──────────────────────────────────────────
-    ranker_scores = ranker.predict(X)                                # (100,)
+    ranker_scores = ranker.predict(X)
     top_positions = np.argsort(ranker_scores)[::-1][:k]
 
     results = []
@@ -83,12 +123,12 @@ def get_movies(q: str, k: int = 10, user_id: int | None = None):
 
 @app.get("/user/{user_id}/features")
 def get_user_features(user_id: int):
-    """Inspect the feature store profile for a given user."""
+    """Inspect a user's feature store profile."""
     if not feature_store.available:
-        return {"error": "Feature store unavailable"}
+        return {"error": "Feature store unavailable — Redis not connected"}
     feats = feature_store.get_user_features(user_id)
     if feats is None:
-        return {"error": f"No profile found for user {user_id}"}
+        return {"error": f"No profile found for user {user_id}. Run populate_feature_store.py first."}
     return feats
 
 
