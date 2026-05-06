@@ -7,9 +7,16 @@ import numpy as np
 from fastapi import FastAPI
 from sentence_transformers import SentenceTransformer
 
+from fastapi.middleware.cors import CORSMiddleware
 from .feature_store import FeatureStore
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 INDEX_DIR = os.path.join(BASE_DIR, "..", "data", "index")
