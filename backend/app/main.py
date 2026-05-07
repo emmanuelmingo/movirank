@@ -16,7 +16,10 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
 from fastapi.middleware.cors import CORSMiddleware
-from .feature_store import FeatureStore
+try:
+    from .feature_store import FeatureStore
+except ImportError:
+    from feature_store import FeatureStore  # when invoked without package context
 
 app = FastAPI()
 app.add_middleware(
