@@ -23,6 +23,7 @@ User features for unseen users return None; callers fall back to defaults.
 
 import json
 import os
+import numpy as np
 import redis
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
@@ -137,6 +138,51 @@ class FeatureStore:
                     "feat_idx"         : int(raw["feat_idx"]),
                 }
         return results
+
+    def update_from_feedback(self, user_id: int, genre_vector: list[float],
+                              action: str, movie_decade: int | None = None) -> dict | None:
+        """
+        Incrementally update a user's genre affinity from a like/dislike signal.
+
+        Like    → nudge affinity toward the movie's genres  (+ALPHA per genre present)
+        Dislike → nudge affinity away from the movie's genres (-ALPHA per genre present)
+
+        A clamp to [0,1] keeps values in range without re-normalisation so
+        multiple quick interactions accumulate naturally.
+        """
+        if not self._available:
+            return None
+
+        ALPHA = 0.12   # shift per interaction; ~8 likes to fully flip a genre
+
+        current = self.get_user_features(user_id)
+        if current is None:
+            current = {
+                "genre_affinity"  : [0.5] * 19,
+                "top_genres"      : [],
+                "favorite_decade" : movie_decade or 0,
+                "avg_rating_given": 3.0,
+                "watch_count"     : 0,
+            }
+
+        affinity  = np.array(current["genre_affinity"], dtype=np.float64)
+        gv        = np.array(genre_vector, dtype=np.float64)
+        direction = 1.0 if action == "like" else -1.0
+
+        affinity  = np.clip(affinity + ALPHA * direction * gv, 0.0, 1.0)
+
+        # EMA on avg_rating_given (like ≈ 4.5 stars, dislike ≈ 1.5 stars)
+        target_rating            = 4.5 if action == "like" else 1.5
+        current["avg_rating_given"] = 0.9 * current["avg_rating_given"] + 0.1 * target_rating
+        current["watch_count"]      = current["watch_count"] + 1
+
+        # Top genres from updated affinity
+        top_idx              = np.argsort(affinity)[::-1][:3]
+        current["genre_affinity"] = affinity.tolist()
+        current["top_genres"]     = [GENRE_NAMES[i] for i in top_idx if affinity[i] > 0.45]
+
+        self.set_user_features(user_id, current)
+        return current
 
     def stats(self) -> dict:
         if not self._available:

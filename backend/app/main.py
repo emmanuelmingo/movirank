@@ -4,7 +4,8 @@ import pickle
 import faiss
 import lightgbm as lgb
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +15,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -33,8 +34,11 @@ feature_store  = FeatureStore()
 with open(os.path.join(INDEX_DIR, "movie_lookup.pkl"), "rb") as f:
     movie_lookup = pickle.load(f)
 
-# movieId -> decade, built once at startup from movie_lookup
+# movieId -> decade and movieId -> feat_idx, built once at startup
+feature_movie_ids    = np.load(os.path.join(INDEX_DIR, "feature_movie_ids.npy"))
+movie_id_to_feat_idx = {int(feature_movie_ids[i]): i for i in range(len(feature_movie_ids))}
 movie_decade_map: dict[int, int] = {}
+
 for entry in movie_lookup:
     yr = entry.get("year")
     if yr and not (isinstance(yr, float) and math.isnan(yr)):
@@ -126,6 +130,29 @@ def get_movies(q: str, k: int = 10, user_id: int | None = None):
         results.append(movie)
 
     return results
+
+
+class FeedbackBody(BaseModel):
+    movie_id: int
+    action: str   # "like" | "dislike"
+
+
+@app.post("/user/{user_id}/feedback")
+def submit_feedback(user_id: int, body: FeedbackBody):
+    if body.action not in ("like", "dislike"):
+        raise HTTPException(status_code=400, detail="action must be 'like' or 'dislike'")
+    if not feature_store.available:
+        raise HTTPException(status_code=503, detail="Feature store unavailable")
+
+    feat_idx = movie_id_to_feat_idx.get(body.movie_id)
+    if feat_idx is None:
+        raise HTTPException(status_code=404, detail=f"Movie {body.movie_id} not in index")
+
+    genre_vector  = genre_matrix[feat_idx].tolist()
+    movie_decade  = movie_decade_map.get(body.movie_id)
+
+    updated = feature_store.update_from_feedback(user_id, genre_vector, body.action, movie_decade)
+    return {"ok": True, "top_genres": updated["top_genres"], "watch_count": updated["watch_count"]}
 
 
 @app.get("/user/{user_id}/features")

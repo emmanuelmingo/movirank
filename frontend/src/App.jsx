@@ -1,7 +1,8 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import SearchBar from "./components/SearchBar";
 import UserSwitcher from "./components/UserSwitcher";
 import MovieCard from "./components/MovieCard";
+import Toast from "./components/Toast";
 
 async function fetchResults(query, userId) {
   const params = new URLSearchParams({ q: query, k: 10 });
@@ -18,6 +19,8 @@ export default function App() {
   const [loading, setLoading]   = useState(false);
   const [error, setError]       = useState(null);
   const [searched, setSearched] = useState(false);
+  const [toast, setToast]       = useState(false);
+  const refreshTimer            = useRef(null);
 
   const runSearch = useCallback(async (q, uid) => {
     setLoading(true);
@@ -43,8 +46,18 @@ export default function App() {
     if (query) runSearch(query, uid);
   }
 
+  function handleFeedback() {
+    setToast(true);
+    clearTimeout(refreshTimer.current);
+    refreshTimer.current = setTimeout(() => {
+      setToast(false);
+      runSearch(query, userId);
+    }, 800);
+  }
+
   return (
     <div className="min-h-screen flex flex-col bg-[#0a0a0a] text-gray-100">
+      <Toast show={toast} message="Profile updated — refreshing results…" />
       {/* Header */}
       <header className="border-b border-gray-800 px-6 py-4 flex items-center gap-3">
         <span className="text-brand font-black text-2xl tracking-tight">MOVIRANK</span>
@@ -101,7 +114,13 @@ export default function App() {
             </p>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3 sm:gap-4">
               {results.map((movie, i) => (
-                <MovieCard key={movie.movieId} movie={movie} rank={i + 1} />
+                <MovieCard
+                  key={movie.movieId}
+                  movie={movie}
+                  rank={i + 1}
+                  userId={userId}
+                  onFeedback={handleFeedback}
+                />
               ))}
             </div>
           </>
