@@ -9,6 +9,7 @@ export default defineConfig({
       "/search":        "http://localhost:8000",
       "/user":          "http://localhost:8000",
       "/feature-store": "http://localhost:8000",
+      "/ab":            "http://localhost:8000",
     },
   },
 })

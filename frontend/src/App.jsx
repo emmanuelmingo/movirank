@@ -16,6 +16,7 @@ export default function App() {
   const [query, setQuery]       = useState("");
   const [userId, setUserId]     = useState(null);
   const [results, setResults]   = useState([]);
+  const [variant, setVariant]   = useState(null);
   const [loading, setLoading]   = useState(false);
   const [error, setError]       = useState(null);
   const [searched, setSearched] = useState(false);
@@ -26,8 +27,9 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const data = await fetchResults(q, uid);
+      const { variant: v, results: data } = await fetchResults(q, uid);
       setResults(data);
+      setVariant(v);
       setSearched(true);
     } catch (e) {
       setError(e.message);
@@ -108,10 +110,21 @@ export default function App() {
 
         {!loading && results.length > 0 && (
           <>
-            <p className="text-gray-500 text-sm mb-6">
-              Top {results.length} results for{" "}
-              <span className="text-white font-medium">"{query}"</span>
-            </p>
+            <div className="flex items-center gap-3 mb-6">
+              <p className="text-gray-500 text-sm">
+                Top {results.length} results for{" "}
+                <span className="text-white font-medium">"{query}"</span>
+              </p>
+              {variant && (
+                <span className={`text-xs font-semibold px-2.5 py-1 rounded-full ${
+                  variant === "ranker"
+                    ? "bg-brand/20 text-brand border border-brand/30"
+                    : "bg-gray-800 text-gray-400 border border-gray-700"
+                }`}>
+                  {variant === "ranker" ? "B · LightGBM ranker" : "A · Baseline (FAISS)"}
+                </span>
+              )}
+            </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3 sm:gap-4">
               {results.map((movie, i) => (
                 <MovieCard

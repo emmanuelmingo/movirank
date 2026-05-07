@@ -1,6 +1,13 @@
+import hashlib
+import json as _json
 import math
 import os
+import pathlib
 import pickle
+import random
+import threading
+from datetime import datetime, timezone
+
 import faiss
 import lightgbm as lgb
 import numpy as np
@@ -23,6 +30,12 @@ BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 INDEX_DIR = os.path.join(BASE_DIR, "..", "data", "index")
 MODEL_DIR = os.path.join(BASE_DIR, "..", "data", "models")
 
+# ── A/B logging setup ─────────────────────────────────────────────────────────
+LOG_DIR  = pathlib.Path(BASE_DIR) / ".." / "data" / "ab_logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "events.jsonl"
+_log_lock = threading.Lock()
+
 # ── Load all assets once at startup ───────────────────────────────────────────
 model          = SentenceTransformer("all-MiniLM-L6-v2", model_kwargs={"use_safetensors": False})
 index          = faiss.read_index(os.path.join(INDEX_DIR, "faiss_index.bin"))
@@ -34,7 +47,6 @@ feature_store  = FeatureStore()
 with open(os.path.join(INDEX_DIR, "movie_lookup.pkl"), "rb") as f:
     movie_lookup = pickle.load(f)
 
-# movieId -> decade and movieId -> feat_idx, built once at startup
 feature_movie_ids    = np.load(os.path.join(INDEX_DIR, "feature_movie_ids.npy"))
 movie_id_to_feat_idx = {int(feature_movie_ids[i]): i for i in range(len(feature_movie_ids))}
 movie_decade_map: dict[int, int] = {}
@@ -50,20 +62,6 @@ def _clean(movie: dict) -> dict:
 
 
 def _user_features(candidate_indices: np.ndarray, user_id: int | None) -> dict:
-    """
-    Returns a dict of user-level scalars used in the feature vector.
-
-    With a known user_id and Redis available:
-      - genre_affinity      : user's personal genre preference vector (19 floats)
-      - avg_rating_norm     : how picky the user is  (their mean rating, normalised)
-      - watch_count_norm    : how active the user is (log-normalised rating count)
-      - favorite_decade     : user's preferred movie decade (e.g. 1990)
-
-    Without a user (anonymous query):
-      - genre_affinity inferred from top-20 FAISS hits
-      - avg_rating_norm / watch_count_norm set to neutral 0.5
-      - favorite_decade = 0 (no decade match bonus applied)
-    """
     fallback_affinity = genre_matrix[candidate_indices[:20]].mean(axis=0)
 
     if user_id is not None and feature_store.available:
@@ -84,6 +82,25 @@ def _user_features(candidate_indices: np.ndarray, user_id: int | None) -> dict:
     }
 
 
+# ── A/B helpers ───────────────────────────────────────────────────────────────
+
+def _assign_variant(user_id: int | None) -> str:
+    """
+    Stable per-user bucket so the same user always gets the same variant.
+    Anonymous sessions are split randomly per request.
+    """
+    if user_id is not None:
+        digest = int(hashlib.md5(str(user_id).encode()).hexdigest(), 16)
+        return "baseline" if digest % 2 == 0 else "ranker"
+    return random.choice(["baseline", "ranker"])
+
+
+def _log_event(event: dict) -> None:
+    with _log_lock:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(event) + "\n")
+
+
 @app.get("/")
 def index_route():
     return {"message": "Hello World"}
@@ -93,43 +110,58 @@ def index_route():
 def get_movies(q: str, k: int = 10, user_id: int | None = None):
     # ── Stage 1: FAISS retrieval (100 candidates) ──────────────────────────────
     query_vector = model.encode([q], normalize_embeddings=True).astype(np.float32)
-    _, candidate_indices = index.search(query_vector, 100)
-    candidate_indices = candidate_indices[0]                          # (100,)
+    faiss_scores, candidate_indices = index.search(query_vector, 100)
+    faiss_scores      = faiss_scores[0]       # (100,)  cosine similarities
+    candidate_indices = candidate_indices[0]  # (100,)
 
-    # ── User features from Redis (or fallback defaults) ────────────────────────
-    uf = _user_features(candidate_indices, user_id)
+    # ── A/B variant assignment ─────────────────────────────────────────────────
+    variant = _assign_variant(user_id)
 
-    # ── Build feature matrix for all 100 candidates (27 features) ─────────────
-    X_items = feature_matrix[candidate_indices]                       # (100, 23)
+    if variant == "ranker":
+        # ── Full pipeline: LightGBM re-ranking ────────────────────────────────
+        uf = _user_features(candidate_indices, user_id)
 
-    genre_overlap = (genre_matrix[candidate_indices] * uf["genre_affinity"]).sum(axis=1)
+        X_items = feature_matrix[candidate_indices]                    # (100, 23)
 
-    decade_match = np.array([
-        1.0 if movie_decade_map.get(movie_lookup[i]["movieId"], -1) == uf["favorite_decade"]
-        else 0.0
-        for i in candidate_indices
-    ], dtype=np.float32)
+        genre_overlap = (genre_matrix[candidate_indices] * uf["genre_affinity"]).sum(axis=1)
 
-    user_cols = np.column_stack([
-        genre_overlap,
-        np.full(100, uf["avg_rating_norm"],  dtype=np.float32),
-        np.full(100, uf["watch_count_norm"], dtype=np.float32),
-        decade_match,
-    ])                                                                # (100, 4)
+        decade_match = np.array([
+            1.0 if movie_decade_map.get(movie_lookup[i]["movieId"], -1) == uf["favorite_decade"]
+            else 0.0
+            for i in candidate_indices
+        ], dtype=np.float32)
 
-    X = np.hstack([X_items, user_cols]).astype(np.float32)           # (100, 27)
+        user_cols = np.column_stack([
+            genre_overlap,
+            np.full(100, uf["avg_rating_norm"],  dtype=np.float32),
+            np.full(100, uf["watch_count_norm"], dtype=np.float32),
+            decade_match,
+        ])                                                             # (100, 4)
 
-    # ── Stage 2: LightGBM re-ranking ──────────────────────────────────────────
-    ranker_scores = ranker.predict(X)
-    top_positions = np.argsort(ranker_scores)[::-1][:k]
+        X = np.hstack([X_items, user_cols]).astype(np.float32)        # (100, 27)
+
+        scores        = ranker.predict(X)
+        top_positions = np.argsort(scores)[::-1][:k]
+    else:
+        # ── Baseline: FAISS cosine similarity order only ───────────────────────
+        top_positions = np.arange(min(k, len(candidate_indices)))
+        scores        = faiss_scores
 
     results = []
     for pos in top_positions:
         movie = _clean(movie_lookup[candidate_indices[pos]])
-        movie["score"] = round(float(ranker_scores[pos]), 4)
+        movie["score"] = round(float(scores[pos]), 4)
         results.append(movie)
 
-    return results
+    _log_event({
+        "ts"           : datetime.now(timezone.utc).isoformat(),
+        "user_id"      : user_id,
+        "query"        : q,
+        "variant"      : variant,
+        "top_movie_ids": [r["movieId"] for r in results],
+    })
+
+    return {"variant": variant, "results": results}
 
 
 class FeedbackBody(BaseModel):
@@ -148,8 +180,8 @@ def submit_feedback(user_id: int, body: FeedbackBody):
     if feat_idx is None:
         raise HTTPException(status_code=404, detail=f"Movie {body.movie_id} not in index")
 
-    genre_vector  = genre_matrix[feat_idx].tolist()
-    movie_decade  = movie_decade_map.get(body.movie_id)
+    genre_vector = genre_matrix[feat_idx].tolist()
+    movie_decade = movie_decade_map.get(body.movie_id)
 
     updated = feature_store.update_from_feedback(user_id, genre_vector, body.action, movie_decade)
     return {"ok": True, "top_genres": updated["top_genres"], "watch_count": updated["watch_count"]}
@@ -157,9 +189,8 @@ def submit_feedback(user_id: int, body: FeedbackBody):
 
 @app.get("/user/{user_id}/features")
 def get_user_features(user_id: int):
-    """Inspect a user's feature store profile."""
     if not feature_store.available:
-        return {"error": "Feature store unavailable — Redis not connected"}
+        return {"error": "Feature store unavailable - Redis not connected"}
     feats = feature_store.get_user_features(user_id)
     if feats is None:
         return {"error": f"No profile found for user {user_id}. Run populate_feature_store.py first."}
@@ -169,3 +200,38 @@ def get_user_features(user_id: int):
 @app.get("/feature-store/stats")
 def feature_store_stats():
     return feature_store.stats()
+
+
+@app.get("/ab/summary")
+def ab_summary():
+    """Aggregate stats from the A/B event log."""
+    if not LOG_FILE.exists():
+        return {"total": 0, "by_variant": {}, "top_queries": []}
+
+    counts: dict[str, int] = {}
+    query_counts: dict[str, int] = {}
+    total = 0
+
+    with open(LOG_FILE, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            v = ev.get("variant", "unknown")
+            counts[v] = counts.get(v, 0) + 1
+            q = ev.get("query", "")
+            if q:
+                query_counts[q] = query_counts.get(q, 0) + 1
+            total += 1
+
+    top_queries = sorted(query_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    return {
+        "total"      : total,
+        "by_variant" : counts,
+        "top_queries": [{"query": q, "count": c} for q, c in top_queries],
+    }
