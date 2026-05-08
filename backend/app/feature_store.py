@@ -1,26 +1,3 @@
-"""
-CineRank - Redis Feature Store Client
-
-Key schema:
-  user:{userId}  → Hash
-    genre_affinity   : JSON float[19]  — normalised genre preference vector
-    top_genres       : JSON str[]      — top-3 preferred genres by name
-    favorite_decade  : int             — e.g. 1990
-    avg_rating_given : float           — mean rating the user gives
-    watch_count      : int             — total movies rated
-
-  item:{movieId}  → Hash
-    genre_vector     : JSON float[19]  — genre multi-hot
-    avg_rating_norm  : float
-    rating_count_norm: float
-    popularity_norm  : float
-    recency_norm     : float
-    feat_idx         : int             — row index in feature_matrix.npy
-
-All keys are given a 7-day TTL so stale profiles expire automatically.
-User features for unseen users return None; callers fall back to defaults.
-"""
-
 import json
 import os
 import numpy as np
@@ -57,7 +34,7 @@ class FeatureStore:
     def available(self) -> bool:
         return self._available
 
-    # ── User features ──────────────────────────────────────────────────────────
+    # User features 
 
     def get_user_features(self, user_id: int) -> dict | None:
         if not self._available:
@@ -86,7 +63,7 @@ class FeatureStore:
         })
         self._client.expire(key, USER_TTL)
 
-    # ── Item features ──────────────────────────────────────────────────────────
+    # Item features 
 
     def get_item_features(self, movie_id: int) -> dict | None:
         if not self._available:
@@ -117,8 +94,7 @@ class FeatureStore:
         })
         self._client.expire(key, ITEM_TTL)
 
-    # ── Batch helpers ──────────────────────────────────────────────────────────
-
+    # Batch helpers 
     def get_item_features_batch(self, movie_ids: list[int]) -> dict[int, dict]:
         """Returns {movieId: features} for all ids found in Redis."""
         if not self._available or not movie_ids:
@@ -141,15 +117,7 @@ class FeatureStore:
 
     def update_from_feedback(self, user_id: int, genre_vector: list[float],
                               action: str, movie_decade: int | None = None) -> dict | None:
-        """
-        Incrementally update a user's genre affinity from a like/dislike signal.
-
-        Like    → nudge affinity toward the movie's genres  (+ALPHA per genre present)
-        Dislike → nudge affinity away from the movie's genres (-ALPHA per genre present)
-
-        A clamp to [0,1] keeps values in range without re-normalisation so
-        multiple quick interactions accumulate naturally.
-        """
+      
         if not self._available:
             return None
 

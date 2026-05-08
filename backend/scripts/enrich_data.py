@@ -1,19 +1,3 @@
-"""
-CineRank - Data Enrichment Script
-Enriches MovieLens movies with TMDB plot overviews and poster URLs.
-
-Setup:
-    1. Sign up at https://www.themoviedb.org/ and get an API key
-    2. Create a .env file in backend/ with: TMDB_API_KEY=your_key_here
-    3. pip install requests python-dotenv
-    4. Run: python backend/scripts/enrich_data.py
-
-Note:
-    - TMDB API has a rate limit of ~40 requests per second
-    - This script processes 62K+ movies, so it takes a while (~30-45 min)
-    - Progress is saved every 500 movies, so you can stop and resume safely
-"""
-
 import pandas as pd
 import requests
 import os
@@ -21,24 +5,23 @@ import time
 import json
 from dotenv import load_dotenv
 
-# --- Load API key ---
+# Load API key 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
 if not TMDB_API_KEY:
     raise ValueError("TMDB_API_KEY not found. Create backend/.env with: TMDB_API_KEY=your_key_here")
 
-# --- Paths ---
+# Paths 
 PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 CACHE_PATH = os.path.join(PROCESSED_DIR, "tmdb_cache.json")
 
-# --- TMDB API ---
+# TMDB API 
 BASE_URL = "https://api.themoviedb.org/3"
 POSTER_BASE_URL = "https://image.tmdb.org/t/p/w500"
 
 
 def load_cache():
-    """Load cached TMDB results to avoid re-fetching."""
     if os.path.exists(CACHE_PATH):
         with open(CACHE_PATH, "r") as f:
             cache = json.load(f)
@@ -48,13 +31,11 @@ def load_cache():
 
 
 def save_cache(cache):
-    """Save TMDB results to cache file."""
     with open(CACHE_PATH, "w") as f:
         json.dump(cache, f)
 
 
 def search_tmdb(title, year=None):
-    """Search TMDB for a movie by title and optional year."""
     params = {
         "api_key": TMDB_API_KEY,
         "query": title,
@@ -78,7 +59,7 @@ def search_tmdb(title, year=None):
                 "tmdb_popularity": movie.get("popularity"),
             }
     except requests.exceptions.RequestException as e:
-        print(f"    API error for '{title}': {e}")
+        print(f" API error for '{title}': {e}")
 
     return {
         "tmdb_id": None,
@@ -90,7 +71,6 @@ def search_tmdb(title, year=None):
 
 
 def enrich_movies(movies):
-    """Fetch TMDB data for all movies."""
     print("\nFetching TMDB data...")
 
     cache = load_cache()
@@ -128,24 +108,16 @@ def enrich_movies(movies):
 
 
 def build_text_for_embeddings(row):
-    """
-    Combine title, genres, overview, and tags into a single text string.
-    This is what sentence-transformers will encode on Day 3.
-    """
     parts = []
-
-    # Title
     parts.append(row["clean_title"])
 
-    # Genres
     if isinstance(row.get("genre_list"), list):
         parts.append(", ".join(row["genre_list"]))
 
-    # TMDB overview
     if row.get("overview"):
         parts.append(row["overview"])
 
-    # User tags
+
     if row.get("tags_combined"):
         parts.append(row["tags_combined"])
 
@@ -153,12 +125,7 @@ def build_text_for_embeddings(row):
 
 
 def main():
-    print("=" * 50)
-    print("CineRank - Data Enrichment")
-    print("=" * 50)
 
-    # Load cleaned data from Day 1
-    print("\nLoading cleaned data...")
     movies = pd.read_parquet(os.path.join(PROCESSED_DIR, "movies.parquet"))
     tags = pd.read_parquet(os.path.join(PROCESSED_DIR, "tags.parquet"))
     movie_stats = pd.read_parquet(os.path.join(PROCESSED_DIR, "movie_stats.parquet"))

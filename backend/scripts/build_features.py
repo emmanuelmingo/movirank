@@ -1,24 +1,3 @@
-"""
-CineRank - Feature Engineering
-Computes a feature matrix for all movies with:
-  - Genre multi-hot encoding  (19 binary columns, one per genre)
-  - Genre overlap score       (Jaccard-ready; used at query time)
-  - Avg rating                (min-max normalised, 0-1)
-  - Rating count              (log-scaled then min-max normalised, 0-1)
-  - Popularity                (log-scaled tmdb_popularity, 0-1; 0 when missing)
-  - Recency                   (year normalised to 0-1, newest = 1)
-
-Output (backend/data/index/):
-  feature_matrix.npy   — float32 array, shape (n_movies, n_features)
-  feature_names.pkl    — list of column names matching the matrix columns
-  feature_movie_ids.npy — int64 array of movieId, same row order as matrix
-
-Row order matches movies_enriched.parquet so it aligns with the FAISS index.
-
-Usage:
-    python backend/scripts/build_features.py
-"""
-
 import os
 import pickle
 import numpy as np
@@ -42,7 +21,6 @@ def load_movies():
 
 
 def genre_multihot(movies):
-    """Binary column per genre. Shape: (n, 19)."""
     matrix = np.zeros((len(movies), len(GENRES)), dtype=np.float32)
     genre_index = {g: i for i, g in enumerate(GENRES)}
     for row, genre_list in enumerate(movies["genre_list"]):
@@ -61,14 +39,12 @@ def minmax(series):
 
 
 def avg_rating_feature(movies):
-    """Normalised average rating (0-1). No nulls."""
     feat = minmax(movies["avg_rating"]).reshape(-1, 1)
     print(f"  Avg rating: min={movies['avg_rating'].min():.2f}  max={movies['avg_rating'].max():.2f}")
     return feat, ["avg_rating_norm"]
 
 
 def rating_count_feature(movies):
-    """Log-normalised rating count (0-1). Captures popularity without extreme skew."""
     log_counts = np.log1p(movies["num_ratings"])
     feat = minmax(log_counts).reshape(-1, 1)
     print(f"  Rating count: min={movies['num_ratings'].min():,}  max={movies['num_ratings'].max():,}")
@@ -76,12 +52,6 @@ def rating_count_feature(movies):
 
 
 def popularity_feature(movies):
-    """
-    Log-normalised TMDB popularity (0-1).
-    ~50% of movies lack TMDB data; missing values are set to 0
-    (treated as unknown/unpopular rather than median-imputed, to
-    preserve the signal that TMDB-listed movies are more prominent).
-    """
     pop = movies["tmdb_popularity"].copy()
     missing_mask = pop.isna()
     pop = pop.fillna(0.0)
@@ -92,10 +62,6 @@ def popularity_feature(movies):
 
 
 def recency_feature(movies):
-    """
-    Year normalised to [0, 1] where 1 = most recent (2019).
-    ~80 movies with missing year get the median year.
-    """
     year = movies["year"].copy()
     median_year = year.median()
     year = year.fillna(median_year)
@@ -135,16 +101,11 @@ def save(matrix, names, movie_ids):
 
 
 def main():
-    print("=" * 50)
-    print("CineRank - Feature Engineering")
-    print("=" * 50)
-
     movies = load_movies()
     matrix, names = build_feature_matrix(movies)
     movie_ids = movies["movieId"].to_numpy(dtype=np.int64)
     save(matrix, names, movie_ids)
 
-    print("\n--- Sample: Toy Story ---")
     idx = movies.index[movies["movieId"] == 1][0]
     row = matrix[idx]
     for name, val in zip(names, row):

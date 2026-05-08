@@ -1,29 +1,3 @@
-"""
-CineRank - Feature Store Population Script
-
-Precomputes user-level and item-level features and writes them to Redis.
-
-User features (per user with >= 20 ratings):
-  - genre_affinity   : normalised genre preference vector (19 floats)
-                       = weighted mean of genre vectors, weight = rating - 3
-                       (positive weight for liked movies, negative for disliked)
-  - top_genres       : top-3 genre names by affinity score
-  - favorite_decade  : decade of the most positively-rated movies
-  - avg_rating_given : mean rating the user gives
-  - watch_count      : total number of movies rated
-
-Item features (all 24k movies):
-  - genre_vector     : genre multi-hot [19 floats]
-  - avg_rating_norm  : normalised average rating
-  - rating_count_norm: log-normalised rating count
-  - popularity_norm  : log-normalised TMDB popularity
-  - recency_norm     : normalised release year
-  - feat_idx         : row index in feature_matrix.npy (for fast numpy lookup)
-
-Usage:
-    python backend/scripts/populate_feature_store.py
-"""
-
 import json
 import os
 import sys
@@ -43,7 +17,6 @@ BATCH_SIZE    = 500   # users written per Redis pipeline flush
 
 
 def load_assets():
-    print("Loading assets...")
     ratings = pd.read_parquet(
         os.path.join(PROCESSED_DIR, "ratings.parquet"),
         columns=["userId", "movieId", "rating", "timestamp"],
@@ -60,7 +33,7 @@ def load_assets():
     return ratings, movies, feature_matrix, feature_movie_ids
 
 
-# ── Item features ──────────────────────────────────────────────────────────────
+# Item features 
 
 def populate_items(fs: FeatureStore, feature_matrix: np.ndarray, feature_movie_ids: np.ndarray):
     print("\nPopulating item features...")
@@ -90,16 +63,13 @@ def populate_items(fs: FeatureStore, feature_matrix: np.ndarray, feature_movie_i
     print(f"  Done: {len(feature_movie_ids):,} items in {time.time() - t:.1f}s")
 
 
-# ── User features ──────────────────────────────────────────────────────────────
+#  User features 
 
-def compute_user_features(user_ratings: pd.DataFrame, movie_year_map: dict,
-                           genre_matrix: np.ndarray, movie_to_feat_idx: dict) -> dict:
-    """Compute feature dict for a single user from their ratings DataFrame."""
-    # Sentiment weight: positive for liked (>3), negative for disliked (<3)
+def compute_user_features(user_ratings: pd.DataFrame, movie_year_map: dict,genre_matrix: np.ndarray, movie_to_feat_idx: dict) -> dict:
     user_ratings = user_ratings.copy()
     user_ratings["weight"] = user_ratings["rating"] - 3.0
 
-    # Genre affinity: weighted sum of genre vectors, normalised to unit scale
+    # weighted sum of genre vectors, normalised to unit scale
     genre_affinity = np.zeros(19, dtype=np.float64)
     decade_weights: dict[int, float] = {}
 
@@ -137,15 +107,12 @@ def compute_user_features(user_ratings: pd.DataFrame, movie_year_map: dict,
     }
 
 
-def populate_users(fs: FeatureStore, ratings: pd.DataFrame, movies: pd.DataFrame,
-                   genre_matrix: np.ndarray, feature_movie_ids: np.ndarray):
-    print("\nPopulating user features...")
+def populate_users(fs: FeatureStore, ratings: pd.DataFrame, movies: pd.DataFrame, genre_matrix: np.ndarray, feature_movie_ids: np.ndarray):
     t = time.time()
 
     movie_to_feat_idx = {int(mid): i for i, mid in enumerate(feature_movie_ids)}
     movie_year_map    = movies.dropna(subset=["year"]).set_index("movieId")["year"].to_dict()
 
-    # Only users with enough ratings
     counts    = ratings.groupby("userId").size()
     eligible  = counts[counts >= MIN_RATINGS].index
     print(f"  Eligible users: {len(eligible):,}")
@@ -179,12 +146,9 @@ def populate_users(fs: FeatureStore, ratings: pd.DataFrame, movies: pd.DataFrame
     print(f"  Done: {done:,} users in {time.time() - t:.1f}s")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# Main
 
 def main():
-    print("=" * 55)
-    print("CineRank - Populate Feature Store")
-    print("=" * 55)
 
     fs = FeatureStore()
     if not fs.available:

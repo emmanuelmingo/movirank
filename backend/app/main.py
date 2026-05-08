@@ -33,13 +33,13 @@ BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 INDEX_DIR = os.path.join(BASE_DIR, "..", "data", "index")
 MODEL_DIR = os.path.join(BASE_DIR, "..", "data", "models")
 
-# ── A/B logging setup ─────────────────────────────────────────────────────────
+# A/B logging setup 
 LOG_DIR  = pathlib.Path(BASE_DIR) / ".." / "data" / "ab_logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "events.jsonl"
 _log_lock = threading.Lock()
 
-# ── Load all assets once at startup ───────────────────────────────────────────
+# Load all assets once at startup 
 model          = SentenceTransformer("all-MiniLM-L6-v2", model_kwargs={"use_safetensors": False})
 index          = faiss.read_index(os.path.join(INDEX_DIR, "faiss_index.bin"))
 feature_matrix = np.load(os.path.join(INDEX_DIR, "feature_matrix.npy"))   # (24010, 23)
@@ -85,13 +85,10 @@ def _user_features(candidate_indices: np.ndarray, user_id: int | None) -> dict:
     }
 
 
-# ── A/B helpers ───────────────────────────────────────────────────────────────
+# A/B helpers 
 
 def _assign_variant(user_id: int | None) -> str:
-    """
-    Stable per-user bucket so the same user always gets the same variant.
-    Anonymous sessions are split randomly per request.
-    """
+
     if user_id is not None:
         digest = int(hashlib.md5(str(user_id).encode()).hexdigest(), 16)
         return "baseline" if digest % 2 == 0 else "ranker"
@@ -111,17 +108,17 @@ def index_route():
 
 @app.get("/search")
 def get_movies(q: str, k: int = 10, user_id: int | None = None):
-    # ── Stage 1: FAISS retrieval (100 candidates) ──────────────────────────────
+    # FAISS retrieval (100 candidates) 
     query_vector = model.encode([q], normalize_embeddings=True).astype(np.float32)
     faiss_scores, candidate_indices = index.search(query_vector, 100)
     faiss_scores      = faiss_scores[0]       # (100,)  cosine similarities
     candidate_indices = candidate_indices[0]  # (100,)
 
-    # ── A/B variant assignment ─────────────────────────────────────────────────
+    # A/B variant assignment 
     variant = _assign_variant(user_id)
 
     if variant == "ranker":
-        # ── Full pipeline: LightGBM re-ranking ────────────────────────────────
+        # Full pipeline: LightGBM re-ranking 
         uf = _user_features(candidate_indices, user_id)
 
         X_items = feature_matrix[candidate_indices]                    # (100, 23)
@@ -146,7 +143,7 @@ def get_movies(q: str, k: int = 10, user_id: int | None = None):
         scores        = ranker.predict(X)
         top_positions = np.argsort(scores)[::-1][:k]
     else:
-        # ── Baseline: FAISS cosine similarity order only ───────────────────────
+        # FAISS cosine similarity order only 
         top_positions = np.arange(min(k, len(candidate_indices)))
         scores        = faiss_scores
 
@@ -207,7 +204,6 @@ def feature_store_stats():
 
 @app.get("/ab/summary")
 def ab_summary():
-    """Aggregate stats from the A/B event log."""
     if not LOG_FILE.exists():
         return {"total": 0, "by_variant": {}, "top_queries": []}
 

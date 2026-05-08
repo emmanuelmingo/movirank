@@ -1,23 +1,3 @@
-"""
-CineRank - LightGBM Ranker Training Pipeline
-
-Steps:
-  1. Load ratings + feature matrix
-  2. Sample users; build positive/negative pairs
-  3. Compute per-pair genre-overlap feature
-  4. Train/val/test split (by user, so no user leaks across splits)
-  5. Train LightGBM LambdaRank model
-  6. Evaluate: NDCG@5, NDCG@10, MRR@10
-  7. Save model + metadata
-
-Positive label  : rating >= 4.0  →  graded: 5★ = 2, 4★ = 1
-Negative label  : 0  (unrated movies sampled per user)
-Negative ratio  : 4 negatives per positive
-
-Usage:
-    python backend/scripts/train_ranker.py
-"""
-
 import os
 import pickle
 import time
@@ -26,13 +6,13 @@ import pandas as pd
 import lightgbm as lgb
 from sklearn.metrics import ndcg_score
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
+# Paths 
 BASE = os.path.dirname(__file__)
 PROCESSED_DIR = os.path.join(BASE, "..", "data", "processed")
 INDEX_DIR     = os.path.join(BASE, "..", "data", "index")
 MODEL_DIR     = os.path.join(BASE, "..", "data", "models")
 
-# ── Hyperparameters ────────────────────────────────────────────────────────────
+# Hyperparameters 
 N_USERS       = 5_000   # users to sample for train+val+test
 MIN_RATINGS   = 20      # skip users with fewer ratings
 POS_THRESHOLD = 4.0     # rating >= this is a positive
@@ -42,10 +22,8 @@ TEST_FRAC     = 0.20    # fraction of sampled users → test
 SEED          = 42
 
 
-# ── 1. Load ────────────────────────────────────────────────────────────────────
 
 def load_data():
-    print("Step 1: Loading data...")
     t = time.time()
 
     ratings = pd.read_parquet(
@@ -67,9 +45,6 @@ def load_data():
     print(f"  Loaded in {time.time() - t:.1f}s")
     return ratings, movies, feature_matrix, feature_movie_ids, feature_names
 
-
-# ── 2. Sample users ────────────────────────────────────────────────────────────
-
 def sample_users(ratings, n, min_ratings, seed):
     print(f"\nStep 2: Sampling up to {n:,} users with >= {min_ratings} ratings...")
     counts = ratings.groupby("userId").size()
@@ -79,15 +54,7 @@ def sample_users(ratings, n, min_ratings, seed):
     print(f"  Eligible: {len(eligible):,}  ->  Sampled: {len(chosen):,}")
     return chosen
 
-
-# ── 3. Build training pairs ────────────────────────────────────────────────────
-
 def build_pairs(ratings, movies, feature_matrix, feature_movie_ids, sampled_users, seed):
-    """
-    Returns a DataFrame with columns:
-      userId, movieId, label, feat_idx,
-      genre_overlap, user_avg_rating_norm, user_watch_count_norm, user_decade_match
-    """
     print("\nStep 3: Building training pairs...")
     t = time.time()
     rng = np.random.default_rng(seed)
@@ -97,7 +64,6 @@ def build_pairs(ratings, movies, feature_matrix, feature_movie_ids, sampled_user
     genre_matrix   = feature_matrix[:, :19]
     user_set       = set(sampled_users.tolist())
 
-    # Movie decade map: movieId -> decade (e.g. 1994 -> 1990)
     movie_decade_map = {
         int(r.movieId): (int(r.year) // 10) * 10
         for r in movies.dropna(subset=["year"]).itertuples()
@@ -117,7 +83,6 @@ def build_pairs(ratings, movies, feature_matrix, feature_movie_ids, sampled_user
     pos = rat[rat["rating"] >= POS_THRESHOLD][["userId", "movieId", "label"]].copy()
     pos["feat_idx"] = pos["movieId"].map(movie_to_idx).astype(int)
 
-    # Per-user stats computed once from all their ratings
     user_stats = {}
     for uid, group in rat.groupby("userId"):
         pos_mids = group.loc[group["rating"] >= POS_THRESHOLD, "movieId"]
@@ -176,8 +141,6 @@ def build_pairs(ratings, movies, feature_matrix, feature_movie_ids, sampled_user
     return df
 
 
-# ── 4. Split by user ───────────────────────────────────────────────────────────
-
 def user_split(df, sampled_users, val_frac, test_frac, seed):
     print("\nStep 4: Splitting train / val / test by user...")
     rng = np.random.default_rng(seed)
@@ -201,9 +164,6 @@ def user_split(df, sampled_users, val_frac, test_frac, seed):
     print(f"  Test  users: {len(test_users):,}  rows: {len(test_df):,}")
     return train_df, val_df, test_df
 
-
-# ── 5. Build LightGBM arrays ───────────────────────────────────────────────────
-
 def to_lgb_arrays(df, feature_matrix, all_feat_names):
     """Returns X, y, group sizes (sorted by userId)."""
     df = df.sort_values("userId")
@@ -214,9 +174,6 @@ def to_lgb_arrays(df, feature_matrix, all_feat_names):
     y      = df["label"].to_numpy(dtype=np.int32)
     groups = df.groupby("userId", sort=True).size().to_numpy(dtype=np.int32)
     return X, y, groups
-
-
-# ── 6. Train ───────────────────────────────────────────────────────────────────
 
 def train(X_tr, y_tr, g_tr, X_val, y_val, g_val, feat_names):
     print("\nStep 5: Training LightGBM LambdaRank...")
@@ -250,8 +207,6 @@ def train(X_tr, y_tr, g_tr, X_val, y_val, g_val, feat_names):
     )
     return model
 
-
-# ── 7. Evaluate ────────────────────────────────────────────────────────────────
 
 def evaluate(model, X_test, y_test, groups_test, k=10):
     print(f"\nStep 6: Evaluating on test set...")
@@ -287,8 +242,6 @@ def evaluate(model, X_test, y_test, groups_test, k=10):
     return np.mean(ndcg5_scores), np.mean(ndcg10_scores), np.mean(mrr_scores)
 
 
-# ── 8. Save ────────────────────────────────────────────────────────────────────
-
 def save_model(model, feat_names):
     os.makedirs(MODEL_DIR, exist_ok=True)
     model_path = os.path.join(MODEL_DIR, "ranker.lgb")
@@ -302,8 +255,6 @@ def save_model(model, feat_names):
     print(f"\n  Saved ranker.lgb     ({size_kb:.0f} KB)")
     print(f"  Saved ranker_meta.pkl")
 
-
-# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     print("=" * 55)
