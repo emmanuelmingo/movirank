@@ -25,12 +25,12 @@ A movie recommendation system built on semantic search and personalised re-ranki
 Run once from the project root in order:
 
 ```bash
-python -m backend.scripts.prepare_data
-python -m backend.scripts.enrich_data
-python -m backend.scripts.build_features
-python -m backend.scripts.build_embeddings
-python -m backend.scripts.train_ranker
-python -m backend.scripts.populate_feature_store
+python -m backend/scripts/prepare_data
+python -m backend/scripts/enrich_data
+python -m backend/scripts/build_features
+python -m backend/scripts/build_embeddings
+python -m backend/scripts/train_ranker
+python -m backend/scripts/populate_feature_store
 ```
 
 ### Backend
@@ -39,7 +39,9 @@ python -m backend.scripts.populate_feature_store
 python -m venv env
 env\Scripts\activate
 pip install fastapi "uvicorn[standard]" sentence-transformers faiss-cpu lightgbm numpy pandas redis pydantic scikit-learn requests
-env\Scripts\uvicorn backend.app.main:app --reload
+cd backend
+cd app
+run uvicorn main:app --reload
 ```
 
 ### Frontend
