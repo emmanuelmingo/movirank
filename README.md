@@ -69,4 +69,4 @@ movirank/
 
 ## Author
 
-[Emmanuel Mingo](mailto:qqqwerrt1@gmail.com)
+[Emmanuel Mingo](mailto:mingoemmanuel06@gmail.com)
