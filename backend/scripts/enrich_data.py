@@ -132,7 +132,7 @@ def main():
 
     print(f"  {len(movies):,} movies loaded")
 
-    # Aggregate tags per movie (combine all user tags into one string)
+    # combine all user tags into one string
     print("\nAggregating tags per movie...")
     tags_per_movie = (
         tags.groupby("movieId")["tag"]
@@ -148,17 +148,15 @@ def main():
     # Merge movie stats
     movies = movies.merge(movie_stats, on="movieId", how="left")
 
-    # Fetch TMDB data
     tmdb_df = enrich_movies(movies)
 
-    # Add TMDB columns to movies
     movies["tmdb_id"] = tmdb_df["tmdb_id"].values
     movies["overview"] = tmdb_df["overview"].values
     movies["poster_url"] = tmdb_df["poster_url"].values
     movies["tmdb_rating"] = tmdb_df["tmdb_rating"].values
     movies["tmdb_popularity"] = tmdb_df["tmdb_popularity"].values
 
-    # Build combined text for embedding generation (Day 3)
+    # Build combined text for embedding generation 
     print("\nBuilding embedding text...")
     movies["embedding_text"] = movies.apply(build_text_for_embeddings, axis=1)
 
